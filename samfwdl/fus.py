@@ -162,6 +162,9 @@ def _format_bytes(size: float) -> str:
     return f"{value:.2f} TiB"
 
 
+_PROGRESS_LINE_WIDTH = 0
+
+
 def _render_progress(
     label: str,
     done: int,
@@ -180,7 +183,13 @@ def _render_progress(
         percent = 0.0
         total_text = "?"
     line = f"{label}: {percent:6.2f}% {_format_bytes(done)}/{total_text} {_format_bytes(speed)}/s"
-    sys.stdout.write(f"\r\033[2K{line}")
+    if os.name == "nt":
+        global _PROGRESS_LINE_WIDTH
+        padding = " " * max(0, _PROGRESS_LINE_WIDTH - len(line))
+        sys.stdout.write(f"\r{line}{padding}")
+        _PROGRESS_LINE_WIDTH = 0 if complete else len(line)
+    else:
+        sys.stdout.write(f"\r\033[2K{line}")
     if complete:
         sys.stdout.write("\n")
     sys.stdout.flush()
