@@ -1,0 +1,56 @@
+name: Firmware Release
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.0
+
+      - name: Install asgard
+        run: python -m pip install .
+
+      - name: Run asgard
+        run: python -m asgard download SM-A236M ARO --output . --decrypt
+
+      - name: Get file path
+        run: |
+          FILE_PATH="$(ls *.zip)"
+          echo "FILE_PATH=$FILE_PATH" >> "$GITHUB_ENV"
+
+      - name: Get file size
+        run: |
+          FILE_SIZE="$(stat --format=%s "${{ env.FILE_PATH }}")"
+          echo "FILE_SIZE=$FILE_SIZE" >> "$GITHUB_ENV"
+
+      - name: Split large file
+        if: ${{ env.FILE_SIZE >= 2147483648 }}
+        run: |
+          split --bytes=2147483647 --numeric-suffixes=1 --suffix-length=3 "${{ env.FILE_PATH }}" "${{ env.FILE_PATH }}.part-"
+          rm "${{ env.FILE_PATH }}"
+
+      - name: Get firmware version
+        run: |
+          FIRMWARE_VERSION="$(python -m asgard checkupdate SM-A236M ARO)"
+          echo "FIRMWARE_VERSION=$FIRMWARE_VERSION" >> "$GITHUB_ENV"
+
+      - name: Check if the tag exists
+        run: |
+          if git ls-remote --tags --exit-code "https://github.com/${{ github.repository }}.git" "refs/tags/${{ env.FIRMWARE_VERSION }}"; then
+            echo "TAG_EXISTS=true" >> "$GITHUB_ENV"
+          else
+            echo "TAG_EXISTS=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: GH Release
+        if: ${{ env.TAG_EXISTS == 'false' }}
+        uses: softprops/action-gh-release@v3.0.1
+        with:
+          files: ${{ env.FILE_PATH }}*
+          name: ${{ env.FIRMWARE_VERSION }}
+          tag_name: ${{ env.FIRMWARE_VERSION }}
