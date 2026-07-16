@@ -3,19 +3,24 @@
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
+import io
 import json
 import os
+import re
 import secrets
 import sys
 import threading
 import time
 import xml.etree.ElementTree as ET
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from http.cookies import CookieError, SimpleCookie
-from pathlib import Path
-from typing import Callable
+from pathlib import Path, PurePosixPath
+from typing import Callable, Iterator
 
 import requests
 from Cryptodome.Cipher import AES
@@ -53,6 +58,9 @@ def _available_worker_count() -> int:
 
 _DOWNLOAD_THREADS = _available_worker_count()
 _DECRYPT_THREADS = _available_worker_count()
+_ARCHIVE_TAIL_CACHE_SIZE = 128 * 1024
+_ARCHIVE_COPY_CHUNK_SIZE = 1024 * 1024
+_CONTENT_RANGE_RE = re.compile(r"bytes\s+(\d+)-(\d+)/(\d+|\*)", re.IGNORECASE)
 
 
 def _md5_digest(text: str) -> bytes:
@@ -110,6 +118,21 @@ class DownloadResult:
     firmware_version: str
     filename: str
     size: int
+
+
+@dataclass(frozen=True)
+class FirmwareArchiveEntry:
+    name: str
+    size: int
+    compressed_size: int
+
+
+@dataclass(frozen=True)
+class FirmwareArchiveListing:
+    firmware_version: str
+    filename: str
+    size: int
+    entries: tuple[FirmwareArchiveEntry, ...]
 
 
 @dataclass(frozen=True)
@@ -487,7 +510,9 @@ class FUSClient:
 
     def _download_headers(self) -> dict[str, str]:
         with self._auth_lock:
-            return self._headers_unlocked(self._build_auth_header_unlocked(cloud=True), no_cache=True)
+            headers = self._headers_unlocked(self._build_auth_header_unlocked(cloud=True), no_cache=True)
+            headers["Accept-Encoding"] = "identity"
+            return headers
 
     def _response_is_401(self, response: requests.Response, body: str) -> bool:
         if response.status_code == 401:
@@ -620,6 +645,288 @@ class FUSClient:
             self._update_identity_state(response)
             return response
         raise FUSError("FUS download authorization failed after nonce refresh")
+
+
+def _validate_content_range(
+    response: requests.Response,
+    *,
+    start: int,
+    end: int,
+    total_size: int,
+) -> None:
+    value = response.headers.get("Content-Range", "").strip()
+    match = _CONTENT_RANGE_RE.fullmatch(value)
+    if match is None:
+        raise RetryableDownloadError(f"download server returned an invalid Content-Range: {value or 'missing'}")
+    response_start, response_end = int(match.group(1)), int(match.group(2))
+    response_total = match.group(3)
+    if response_start != start or response_end != end:
+        raise RetryableDownloadError(
+            "download server returned the wrong byte range: "
+            f"expected {start}-{end}, got {response_start}-{response_end}"
+        )
+    if response_total == "*" or int(response_total) != total_size:
+        raise RetryableDownloadError(
+            f"download server returned the wrong file size: expected {total_size}, got {response_total}"
+        )
+
+
+def _read_download_range(
+    *,
+    client: FUSClient,
+    remote_path: str,
+    start: int,
+    end: int,
+    total_size: int,
+    recover_download: Callable[[], None] | None = None,
+) -> bytes:
+    expected_size = end - start + 1
+    for attempt in range(1, _DOWNLOAD_RETRIES + 2):
+        response: requests.Response | None = None
+        try:
+            response = client.download_file(remote_path, start=start, end=end)
+            _validate_content_range(response, start=start, end=end, total_size=total_size)
+            chunks: list[bytes] = []
+            received = 0
+            for chunk in response.iter_content(chunk_size=_RANGE_CHUNK_SIZE):
+                if not chunk:
+                    continue
+                received += len(chunk)
+                if received > expected_size:
+                    raise RetryableDownloadError(
+                        f"download server returned more data than requested for range {start}-{end}"
+                    )
+                chunks.append(chunk)
+            if received != expected_size:
+                raise RetryableDownloadError(
+                    f"download server returned {received} bytes for range {start}-{end}, expected {expected_size}"
+                )
+            return b"".join(chunks)
+        except (requests.RequestException, OSError, RetryableDownloadError) as exc:
+            if attempt > _DOWNLOAD_RETRIES:
+                raise FUSError(f"range {start}-{end} failed after retries: {exc}") from exc
+            if recover_download is not None and attempt % _DOWNLOAD_RECOVERY_INTERVAL == 0:
+                try:
+                    recover_download()
+                except Exception as recovery_exc:
+                    raise FUSError(f"download recovery failed: {recovery_exc}") from recovery_exc
+                time.sleep(_RATE_LIMIT_COOLDOWN_S)
+            time.sleep(_RETRY_BACKOFF_S * attempt)
+        finally:
+            if response is not None:
+                response.close()
+    raise FUSError(f"range {start}-{end} failed")
+
+
+class _FUSDecryptingReader(io.RawIOBase):
+    def __init__(
+        self,
+        *,
+        client: FUSClient,
+        remote_path: str,
+        encrypted_size: int,
+        key: bytes,
+        recover_download: Callable[[], None] | None = None,
+    ):
+        super().__init__()
+        if encrypted_size <= 0 or encrypted_size % _AES_BLOCK_SIZE:
+            raise FUSError("invalid encrypted firmware size")
+        self._client = client
+        self._remote_path = remote_path
+        self._encrypted_size = int(encrypted_size)
+        self._key = key
+        self._recover_download = recover_download
+        self._position = 0
+        self._response: requests.Response | None = None
+        self._response_iter: Iterator[bytes] | None = None
+        self._cipher: AES | None = None
+        self._cipher_buffer = bytearray()
+        self._plain_buffer = bytearray()
+        self._stream_discard = 0
+        self._stream_failures = 0
+        self._stream_failure_position: int | None = None
+
+        tail_start = max(0, self._encrypted_size - _ARCHIVE_TAIL_CACHE_SIZE)
+        tail_start -= tail_start % _AES_BLOCK_SIZE
+        encrypted_tail = _read_download_range(
+            client=self._client,
+            remote_path=self._remote_path,
+            start=tail_start,
+            end=self._encrypted_size - 1,
+            total_size=self._encrypted_size,
+            recover_download=self._recover_download,
+        )
+        decrypted_tail = AES.new(self._key, AES.MODE_ECB).decrypt(encrypted_tail)
+        unpadded_last_block = _pkcs7_unpad(decrypted_tail[-_AES_BLOCK_SIZE:])
+        padding_size = _AES_BLOCK_SIZE - len(unpadded_last_block)
+        self._size = self._encrypted_size - padding_size
+        self._tail_start = min(tail_start, self._size)
+        self._tail = decrypted_tail[: self._size - tail_start]
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        self._checkClosed()
+        return self._position
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        self._checkClosed()
+        if whence == os.SEEK_SET:
+            target = int(offset)
+        elif whence == os.SEEK_CUR:
+            target = self._position + int(offset)
+        elif whence == os.SEEK_END:
+            target = self._size + int(offset)
+        else:
+            raise ValueError(f"invalid whence: {whence}")
+        if target < 0:
+            raise ValueError("negative seek position")
+        if target == self._position:
+            return target
+
+        buffered_end = self._position + len(self._plain_buffer)
+        if self._position < target <= buffered_end:
+            del self._plain_buffer[: target - self._position]
+            self._position = target
+            return target
+
+        self._close_stream()
+        self._plain_buffer.clear()
+        self._position = target
+        return target
+
+    def read(self, size: int = -1) -> bytes:
+        self._checkClosed()
+        if size == 0 or self._position >= self._size:
+            return b""
+        if size is None or size < 0:
+            remaining = self._size - self._position
+        else:
+            remaining = min(int(size), self._size - self._position)
+        chunks: list[bytes] = []
+
+        while remaining > 0:
+            if self._position >= self._tail_start:
+                self._close_stream()
+                tail_offset = self._position - self._tail_start
+                take = min(remaining, len(self._tail) - tail_offset)
+                if take <= 0:
+                    break
+                chunks.append(self._tail[tail_offset : tail_offset + take])
+                self._position += take
+                remaining -= take
+                continue
+
+            if not self._plain_buffer:
+                self._fill_stream_buffer()
+            if not self._plain_buffer:
+                raise FUSError(f"unexpected end of firmware data at byte {self._position}")
+            take = min(remaining, len(self._plain_buffer))
+            chunks.append(bytes(self._plain_buffer[:take]))
+            del self._plain_buffer[:take]
+            self._position += take
+            remaining -= take
+
+        return b"".join(chunks)
+
+    def close(self) -> None:
+        if not self.closed:
+            self._close_stream()
+        super().close()
+
+    def _open_stream(self) -> None:
+        request_start = self._position - (self._position % _AES_BLOCK_SIZE)
+        response = self._client.download_file(
+            self._remote_path,
+            start=request_start,
+            end=self._encrypted_size - 1,
+        )
+        try:
+            _validate_content_range(
+                response,
+                start=request_start,
+                end=self._encrypted_size - 1,
+                total_size=self._encrypted_size,
+            )
+        except Exception:
+            response.close()
+            raise
+        self._response = response
+        self._response_iter = response.iter_content(chunk_size=_RANGE_CHUNK_SIZE)
+        self._cipher = AES.new(self._key, AES.MODE_ECB)
+        self._cipher_buffer.clear()
+        self._stream_discard = self._position - request_start
+
+    def _close_stream(self) -> None:
+        response = self._response
+        self._response = None
+        self._response_iter = None
+        self._cipher = None
+        self._cipher_buffer.clear()
+        self._stream_discard = 0
+        if response is not None:
+            response.close()
+
+    def _retry_stream(self, exc: Exception) -> None:
+        self._close_stream()
+        if self._stream_failure_position == self._position:
+            self._stream_failures += 1
+        else:
+            self._stream_failure_position = self._position
+            self._stream_failures = 1
+        if self._stream_failures > _DOWNLOAD_RETRIES:
+            raise FUSError(f"firmware stream failed after retries at byte {self._position}: {exc}") from exc
+        if (
+            self._recover_download is not None
+            and self._stream_failures % _DOWNLOAD_RECOVERY_INTERVAL == 0
+        ):
+            try:
+                self._recover_download()
+            except Exception as recovery_exc:
+                raise FUSError(f"download recovery failed: {recovery_exc}") from recovery_exc
+            time.sleep(_RATE_LIMIT_COOLDOWN_S)
+        time.sleep(_RETRY_BACKOFF_S * self._stream_failures)
+
+    def _fill_stream_buffer(self) -> None:
+        stream_limit = min(self._size, self._tail_start)
+        while not self._plain_buffer and self._position < stream_limit:
+            try:
+                if self._response_iter is None:
+                    self._open_stream()
+                if self._response_iter is None:
+                    raise RetryableDownloadError("download stream did not start")
+                chunk = next(self._response_iter)
+                if not chunk:
+                    continue
+                self._cipher_buffer.extend(chunk)
+                block_size = (len(self._cipher_buffer) // _AES_BLOCK_SIZE) * _AES_BLOCK_SIZE
+                if block_size == 0:
+                    continue
+                encrypted = bytes(self._cipher_buffer[:block_size])
+                del self._cipher_buffer[:block_size]
+                if self._cipher is None:
+                    raise RetryableDownloadError("download stream lost its decryptor")
+                plain = self._cipher.decrypt(encrypted)
+                if self._stream_discard:
+                    discarded = min(self._stream_discard, len(plain))
+                    plain = plain[discarded:]
+                    self._stream_discard -= discarded
+                remaining = stream_limit - self._position
+                if len(plain) > remaining:
+                    plain = plain[:remaining]
+                self._plain_buffer.extend(plain)
+            except StopIteration:
+                if self._cipher_buffer:
+                    error = RetryableDownloadError("download stream ended with a partial encrypted block")
+                else:
+                    error = RetryableDownloadError("download stream ended before the requested data")
+                self._retry_stream(error)
+            except (requests.RequestException, OSError, RetryableDownloadError) as exc:
+                self._retry_stream(exc)
 
 
 def _parse_binary_info(response_text: str) -> BinaryInfo:
@@ -867,6 +1174,250 @@ def get_v4_key(model: str, region: str, *, firmware_version: str | None = None, 
 def get_v2_key(version: str, model: str, region: str) -> bytes:
     deckey = f"{_upper_code(region)}:{_upper_code(model)}:{normalize_version_code(version)}"
     return _md5_digest(deckey)
+
+
+def _decryption_key_from_info(info: BinaryInfo, model: str, region: str) -> bytes:
+    firmware = info.binary_version
+    if not firmware:
+        raise FUSError("FUS did not return a firmware version")
+    if info.filename.lower().endswith(".enc2"):
+        return get_v2_key(firmware, model, region)
+    if not info.logic_value:
+        raise FUSError("FUS did not return the logic value required for v4 decryption")
+    return _md5_digest(get_logic_check(firmware, info.logic_value))
+
+
+@dataclass
+class _RemoteFirmwareArchive:
+    model: str
+    region: str
+    info: BinaryInfo
+    firmware_version: str
+    archive: zipfile.ZipFile
+
+
+@contextmanager
+def _open_remote_firmware_archive(
+    *,
+    model: str,
+    region: str,
+    firmware_version: str | None = None,
+    force_firmware: bool = False,
+) -> Iterator[_RemoteFirmwareArchive]:
+    model_u, region_u = _device_codes(model, region)
+    client = FUSClient()
+    info = _resolve_versioned_info(client, model_u, region_u, str(firmware_version) if force_firmware else None)
+    firmware = info.binary_version or ""
+    if not firmware:
+        raise FUSError("FUS did not return a firmware version")
+
+    initialize_download(client, info, region_u)
+    remote_path = f"{info.model_path}{info.filename}"
+
+    def recover_download() -> None:
+        client.refresh_auth()
+        initialize_download(client, info, region_u)
+
+    reader = _FUSDecryptingReader(
+        client=client,
+        remote_path=remote_path,
+        encrypted_size=info.size,
+        key=_decryption_key_from_info(info, model_u, region_u),
+        recover_download=recover_download,
+    )
+    try:
+        archive = zipfile.ZipFile(reader)
+    except zipfile.BadZipFile as exc:
+        reader.close()
+        raise FUSError(f"decrypted firmware is not a valid ZIP archive: {exc}") from exc
+    except Exception:
+        reader.close()
+        raise
+
+    try:
+        yield _RemoteFirmwareArchive(
+            model=model_u,
+            region=region_u,
+            info=info,
+            firmware_version=firmware,
+            archive=archive,
+        )
+    finally:
+        try:
+            archive.close()
+        finally:
+            reader.close()
+
+
+def list_firmware_entries(
+    *,
+    model: str,
+    region: str,
+    firmware_version: str | None = None,
+    force_firmware: bool = False,
+) -> FirmwareArchiveListing:
+    with _open_remote_firmware_archive(
+        model=model,
+        region=region,
+        firmware_version=firmware_version,
+        force_firmware=force_firmware,
+    ) as remote:
+        entries = tuple(
+            FirmwareArchiveEntry(
+                name=entry.filename,
+                size=entry.file_size,
+                compressed_size=entry.compress_size,
+            )
+            for entry in remote.archive.infolist()
+            if not entry.is_dir()
+        )
+        return FirmwareArchiveListing(
+            firmware_version=remote.firmware_version,
+            filename=remote.info.filename,
+            size=remote.info.size,
+            entries=entries,
+        )
+
+
+def _entry_matches_selector(entry: zipfile.ZipInfo, selector: str) -> bool:
+    normalized_selector = str(selector or "").strip().replace("\\", "/")
+    if not normalized_selector:
+        raise ValueError("entry selector cannot be empty")
+    name = entry.filename.replace("\\", "/")
+    basename = PurePosixPath(name).name
+    selector_lower = normalized_selector.casefold()
+    name_lower = name.casefold()
+    basename_lower = basename.casefold()
+    if name_lower == selector_lower or basename_lower == selector_lower:
+        return True
+    if any(character in normalized_selector for character in "*?["):
+        return fnmatch.fnmatchcase(name_lower, selector_lower) or fnmatch.fnmatchcase(basename_lower, selector_lower)
+    return (
+        name_lower.startswith(f"{selector_lower}_")
+        or basename_lower.startswith(f"{selector_lower}_")
+    )
+
+
+def _select_firmware_entries(
+    entries: list[zipfile.ZipInfo],
+    selectors: tuple[str, ...],
+) -> list[zipfile.ZipInfo]:
+    files = [entry for entry in entries if not entry.is_dir()]
+    selected_offsets: set[int] = set()
+    selected: list[zipfile.ZipInfo] = []
+    unmatched: list[str] = []
+    for selector in selectors:
+        matches = [entry for entry in files if _entry_matches_selector(entry, selector)]
+        if not matches:
+            unmatched.append(selector)
+            continue
+        for entry in matches:
+            if entry.header_offset in selected_offsets:
+                continue
+            selected_offsets.add(entry.header_offset)
+            selected.append(entry)
+    if unmatched:
+        available = ", ".join(entry.filename for entry in files)
+        raise FUSError(
+            f"no archive entry matched {', '.join(repr(selector) for selector in unmatched)}"
+            + (f"; available entries: {available}" if available else "")
+        )
+    return selected
+
+
+def _entry_output_path(output_dir: Path, entry_name: str) -> Path:
+    filename = PurePosixPath(str(entry_name or "").replace("\\", "/")).name
+    if not filename or filename in {".", ".."}:
+        raise FUSError(f"invalid archive entry name: {entry_name!r}")
+    return output_dir / filename
+
+
+def download_firmware_entries(
+    *,
+    model: str,
+    region: str,
+    selectors: tuple[str, ...] | list[str],
+    out_dir: str | os.PathLike[str],
+    firmware_version: str | None = None,
+    force_firmware: bool = False,
+) -> tuple[Path, ...]:
+    selector_values = tuple(str(selector) for selector in selectors)
+    if not selector_values:
+        raise ValueError("at least one entry selector is required")
+    output_dir = Path(out_dir).expanduser()
+    if output_dir.exists() and not output_dir.is_dir():
+        raise FUSError(f"entry output must be a directory: {output_dir}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_root = output_dir.resolve()
+
+    with _open_remote_firmware_archive(
+        model=model,
+        region=region,
+        firmware_version=firmware_version,
+        force_firmware=force_firmware,
+    ) as remote:
+        selected = _select_firmware_entries(remote.archive.infolist(), selector_values)
+        destinations: list[tuple[zipfile.ZipInfo, Path]] = []
+        destination_keys: set[str] = set()
+        for entry in selected:
+            destination = _entry_output_path(output_root, entry.filename)
+            destination_key = os.path.normcase(str(destination))
+            if destination_key in destination_keys:
+                raise FUSError(f"multiple archive entries map to the same output path: {destination}")
+            destination_keys.add(destination_key)
+            if destination.exists():
+                raise FUSError(f"{destination} already exists")
+            destinations.append((entry, destination))
+
+        _print_info(f"model: {remote.model}")
+        _print_info(f"region: {remote.region}")
+        _print_info(f"firmware: {remote.firmware_version}")
+        _print_info(f"filename: {remote.info.filename}")
+        _print_info(f"size: {_format_bytes(remote.info.size)}")
+        _print_info(f"entries: {len(destinations)}")
+        _print_info(f"output: {output_dir}")
+
+        completed_paths: list[Path] = []
+        for entry, destination in destinations:
+            started_at = time.monotonic()
+            done = 0
+            complete = False
+            part_path = _partial_output_path(destination)
+            try:
+                with part_path.open("xb") as output, remote.archive.open(entry, "r") as source:
+                    while True:
+                        chunk = source.read(_ARCHIVE_COPY_CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        output.write(chunk)
+                        done += len(chunk)
+                        _render_progress(
+                            f"Downloading {PurePosixPath(entry.filename).name}",
+                            done,
+                            entry.file_size,
+                            started_at,
+                        )
+                _render_progress(
+                    f"Downloading {PurePosixPath(entry.filename).name}",
+                    done,
+                    entry.file_size,
+                    started_at,
+                    complete=True,
+                )
+                if destination.exists():
+                    raise FUSError(f"{destination} already exists")
+                part_path.replace(destination)
+                complete = True
+                completed_paths.append(destination)
+            except FUSError:
+                raise
+            except Exception as exc:
+                raise FUSError(f"could not extract archive entry {entry.filename!r}: {exc}") from exc
+            finally:
+                if not complete:
+                    part_path.unlink(missing_ok=True)
+
+        return tuple(completed_paths)
 
 
 def _decrypt_range(
@@ -1224,11 +1775,7 @@ def download_firmware(
         meta_path.unlink(missing_ok=True)
         return DownloadResult(temp_path, None, firmware, info.filename, info.size)
 
-    decrypt_key = (
-        get_v2_key(firmware, model_u, region_u)
-        if info.filename.lower().endswith(".enc2")
-        else get_v4_key(model_u, region_u, firmware_version=firmware, force_firmware=force_firmware)
-    )
+    decrypt_key = _decryption_key_from_info(info, model_u, region_u)
     if done_before < info.size:
         _download_ranges_parallel(
             client=client,

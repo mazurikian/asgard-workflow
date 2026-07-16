@@ -138,9 +138,25 @@ def _build_parser() -> argparse.ArgumentParser:
     download_parser = subparsers.add_parser("download", help="Download firmware from FUS")
     _add_device_args(download_parser)
     _add_firmware_override_args(download_parser)
-    download_parser.add_argument("-o", "--output", required=True, help="Output file or directory")
+    download_parser.add_argument(
+        "-o",
+        "--output",
+        help="Output file or directory; --entry always treats this as a directory",
+    )
     download_parser.add_argument("--resume", action="store_true")
     download_parser.add_argument("--decrypt", action="store_true", help="Decrypt while downloading")
+    archive_mode = download_parser.add_mutually_exclusive_group()
+    archive_mode.add_argument(
+        "--list-entries",
+        action="store_true",
+        help="List files inside the remote firmware ZIP without downloading the package",
+    )
+    archive_mode.add_argument(
+        "--entry",
+        action="append",
+        metavar="SELECTOR",
+        help="Download a matching file from inside the firmware ZIP; repeat or use a glob such as '*.zip'",
+    )
 
     decrypt_parser = subparsers.add_parser("decrypt", help="Decrypt an encrypted FUS package")
     _add_device_args(decrypt_parser)
@@ -177,6 +193,51 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "download":
+            if args.list_entries:
+                if args.resume:
+                    parser.error("--resume cannot be used with --list-entries")
+                if args.decrypt:
+                    parser.error("--decrypt cannot be used with --list-entries")
+                if args.output:
+                    parser.error("--output cannot be used with --list-entries")
+                listing = fus.list_firmware_entries(
+                    model=args.model,
+                    region=args.region,
+                    firmware_version=args.firmware,
+                    force_firmware=args.force_firmware,
+                )
+                print(f"firmware: {listing.firmware_version}")
+                print(f"filename: {listing.filename}")
+                print(f"size: {fus._format_bytes(listing.size)}")
+                print()
+                print(f"{'Size':>12} {'Compressed':>12}  Name")
+                for entry in listing.entries:
+                    print(
+                        f"{fus._format_bytes(entry.size):>12} "
+                        f"{fus._format_bytes(entry.compressed_size):>12}  {entry.name}"
+                    )
+                return 0
+
+            if not args.output:
+                parser.error("--output is required unless --list-entries is used")
+
+            if args.entry:
+                if args.resume:
+                    parser.error("--resume is not supported with --entry")
+                if args.decrypt:
+                    parser.error("--decrypt is not needed with --entry; entries are decrypted automatically")
+                paths = fus.download_firmware_entries(
+                    model=args.model,
+                    region=args.region,
+                    firmware_version=args.firmware,
+                    force_firmware=args.force_firmware,
+                    selectors=args.entry,
+                    out_dir=args.output,
+                )
+                for path in paths:
+                    print(path)
+                return 0
+
             out_dir, out_file = _download_output_args(args.output)
             result = fus.download_firmware(
                 model=args.model,
