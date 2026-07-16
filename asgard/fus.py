@@ -8,15 +8,19 @@ import hashlib
 import io
 import json
 import os
+import queue
 import re
 import secrets
+import struct
 import sys
+import tarfile
 import threading
 import time
 import xml.etree.ElementTree as ET
 import zipfile
+import zlib
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from http.cookies import CookieError, SimpleCookie
 from pathlib import Path, PurePosixPath
@@ -60,7 +64,21 @@ _DOWNLOAD_THREADS = _available_worker_count()
 _DECRYPT_THREADS = _available_worker_count()
 _ARCHIVE_TAIL_CACHE_SIZE = 128 * 1024
 _ARCHIVE_COPY_CHUNK_SIZE = 1024 * 1024
+_TAR_INDEX_SPACING = 8 * 1024 * 1024
+_TAR_INDEX_SCAN_BUFFER_SIZE = 1024 * 1024
+_TAR_INDEX_MEMBER_BUFFER_SIZE = 32 * 1024 * 1024
+_TAR_INDEX_VERSION = 1
 _CONTENT_RANGE_RE = re.compile(r"bytes\s+(\d+)-(\d+)/(\d+|\*)", re.IGNORECASE)
+_ZIP_LOCAL_FILE_HEADER = struct.Struct("<I5H3I2H")
+_ZIP_LOCAL_FILE_HEADER_SIGNATURE = 0x04034B50
+_GZIP_HEADER = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff"
+_SPARSE_HEADER = struct.Struct("<I4H4I")
+_SPARSE_CHUNK_HEADER = struct.Struct("<2H2I")
+_SPARSE_MAGIC = 0xED26FF3A
+_SPARSE_RAW = 0xCAC1
+_SPARSE_FILL = 0xCAC2
+_SPARSE_DONT_CARE = 0xCAC3
+_SPARSE_CRC32 = 0xCAC4
 
 
 def _md5_digest(text: str) -> bytes:
@@ -136,6 +154,26 @@ class FirmwareArchiveListing:
 
 
 @dataclass(frozen=True)
+class FirmwareTarEntry:
+    name: str
+    size: int
+
+
+@dataclass(frozen=True)
+class _IndexedTarMember:
+    name: str
+    size: int
+    offset_data: int
+
+
+@dataclass(frozen=True)
+class _TarIndexCache:
+    complete: bool
+    members: tuple[_IndexedTarMember, ...]
+    index_path: Path
+
+
+@dataclass(frozen=True)
 class FirmwareHistoryEntry:
     firmware_version: str
     index: str
@@ -202,10 +240,10 @@ def _render_progress(
     if total > 0:
         percent = min(100.0, (done / total) * 100.0)
         total_text = _format_bytes(total)
+        progress_text = f"{percent:6.2f}% {_format_bytes(done)}/{total_text}"
     else:
-        percent = 0.0
-        total_text = "?"
-    line = f"{label}: {percent:6.2f}% {_format_bytes(done)}/{total_text} {_format_bytes(speed)}/s"
+        progress_text = _format_bytes(done)
+    line = f"{label}: {progress_text} {_format_bytes(speed)}/s"
     if os.name == "nt":
         global _PROGRESS_LINE_WIDTH
         padding = " " * max(0, _PROGRESS_LINE_WIDTH - len(line))
@@ -1190,6 +1228,7 @@ class _RemoteFirmwareArchive:
     region: str
     info: BinaryInfo
     firmware_version: str
+    reader: _FUSDecryptingReader
     archive: zipfile.ZipFile
 
 
@@ -1203,32 +1242,38 @@ def _open_remote_firmware_archive(
 ) -> Iterator[_RemoteFirmwareArchive]:
     model_u, region_u = _device_codes(model, region)
     client = FUSClient()
-    info = _resolve_versioned_info(client, model_u, region_u, str(firmware_version) if force_firmware else None)
-    firmware = info.binary_version or ""
-    if not firmware:
-        raise FUSError("FUS did not return a firmware version")
+    try:
+        info = _resolve_versioned_info(client, model_u, region_u, str(firmware_version) if force_firmware else None)
+        firmware = info.binary_version or ""
+        if not firmware:
+            raise FUSError("FUS did not return a firmware version")
 
-    initialize_download(client, info, region_u)
-    remote_path = f"{info.model_path}{info.filename}"
-
-    def recover_download() -> None:
-        client.refresh_auth()
         initialize_download(client, info, region_u)
+        remote_path = f"{info.model_path}{info.filename}"
 
-    reader = _FUSDecryptingReader(
-        client=client,
-        remote_path=remote_path,
-        encrypted_size=info.size,
-        key=_decryption_key_from_info(info, model_u, region_u),
-        recover_download=recover_download,
-    )
+        def recover_download() -> None:
+            client.refresh_auth()
+            initialize_download(client, info, region_u)
+
+        reader = _FUSDecryptingReader(
+            client=client,
+            remote_path=remote_path,
+            encrypted_size=info.size,
+            key=_decryption_key_from_info(info, model_u, region_u),
+            recover_download=recover_download,
+        )
+    except Exception:
+        client.session.close()
+        raise
     try:
         archive = zipfile.ZipFile(reader)
     except zipfile.BadZipFile as exc:
         reader.close()
+        client.session.close()
         raise FUSError(f"decrypted firmware is not a valid ZIP archive: {exc}") from exc
     except Exception:
         reader.close()
+        client.session.close()
         raise
 
     try:
@@ -1237,13 +1282,17 @@ def _open_remote_firmware_archive(
             region=region_u,
             info=info,
             firmware_version=firmware,
+            reader=reader,
             archive=archive,
         )
     finally:
         try:
             archive.close()
         finally:
-            reader.close()
+            try:
+                reader.close()
+            finally:
+                client.session.close()
 
 
 def list_firmware_entries(
@@ -1319,11 +1368,903 @@ def _select_firmware_entries(
     return selected
 
 
+def _select_single_firmware_entry(entries: list[zipfile.ZipInfo], selector: str) -> zipfile.ZipInfo:
+    selected = _select_firmware_entries(entries, (selector,))
+    if len(selected) != 1:
+        names = ", ".join(entry.filename for entry in selected)
+        raise FUSError(f"archive selector {selector!r} matched multiple entries: {names}")
+    return selected[0]
+
+
+class _TarIndexUnavailable(Exception):
+    pass
+
+
+class _VirtualGzipReader(io.RawIOBase):
+    def __init__(
+        self,
+        source: _FUSDecryptingReader,
+        *,
+        data_offset: int,
+        compressed_size: int,
+        crc: int,
+        uncompressed_size: int,
+    ):
+        super().__init__()
+        self._source = source
+        self._data_offset = data_offset
+        self._compressed_size = compressed_size
+        self._footer = struct.pack("<II", crc, uncompressed_size & 0xFFFFFFFF)
+        self._size = len(_GZIP_HEADER) + compressed_size + len(self._footer)
+        self._position = 0
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        self._checkClosed()
+        return self._position
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        self._checkClosed()
+        if whence == os.SEEK_SET:
+            target = int(offset)
+        elif whence == os.SEEK_CUR:
+            target = self._position + int(offset)
+        elif whence == os.SEEK_END:
+            target = self._size + int(offset)
+        else:
+            raise ValueError(f"invalid whence: {whence}")
+        if target < 0:
+            raise ValueError("negative seek position")
+        self._position = min(target, self._size)
+        return self._position
+
+    def read(self, size: int = -1) -> bytes:
+        self._checkClosed()
+        if self._position >= self._size or size == 0:
+            return b""
+        remaining = self._size - self._position
+        amount = remaining if size is None or size < 0 else min(int(size), remaining)
+        chunks: list[bytes] = []
+
+        header_end = len(_GZIP_HEADER)
+        data_end = header_end + self._compressed_size
+        while amount:
+            if self._position < header_end:
+                take = min(amount, header_end - self._position)
+                chunks.append(_GZIP_HEADER[self._position : self._position + take])
+            elif self._position < data_end:
+                take = min(amount, data_end - self._position)
+                source_offset = self._data_offset + self._position - header_end
+                self._source.seek(source_offset)
+                chunk = self._source.read(take)
+                if len(chunk) != take:
+                    raise FUSError("unexpected end of compressed firmware entry")
+                chunks.append(chunk)
+            else:
+                footer_offset = self._position - data_end
+                take = min(amount, len(self._footer) - footer_offset)
+                chunks.append(self._footer[footer_offset : footer_offset + take])
+            self._position += take
+            amount -= take
+
+        return b"".join(chunks)
+
+
+class _BoundedReader(io.RawIOBase):
+    def __init__(self, source: io.BufferedIOBase, size: int):
+        super().__init__()
+        self._source = source
+        self._remaining = size
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: bytearray | memoryview) -> int:
+        self._checkClosed()
+        if self._remaining <= 0:
+            return 0
+        view = memoryview(buffer)
+        amount = min(len(view), self._remaining)
+        try:
+            data = self._source.read(amount)
+        except Exception as exc:
+            if exc.__class__.__module__.partition(".")[0] == "indexed_gzip" or isinstance(
+                exc,
+                (EOFError, ValueError, zlib.error),
+            ):
+                raise _TarIndexUnavailable from exc
+            raise
+        if not data:
+            raise _TarIndexUnavailable
+        view[: len(data)] = data
+        self._remaining -= len(data)
+        return len(data)
+
+
+class _PrefetchReader(io.RawIOBase):
+    def __init__(self, source: io.BufferedIOBase):
+        super().__init__()
+        self._source = source
+        self._queue: queue.Queue[bytes | BaseException | None] = queue.Queue(maxsize=2)
+        self._stop = threading.Event()
+        self._buffer = b""
+        self._buffer_offset = 0
+        self._eof = False
+        self._thread = threading.Thread(target=self._produce, name="asgard-prefetch", daemon=True)
+        self._thread.start()
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: bytearray | memoryview) -> int:
+        self._checkClosed()
+        if not buffer:
+            return 0
+        if self._eof:
+            return 0
+        if self._buffer_offset >= len(self._buffer):
+            item = self._queue.get()
+            if item is None:
+                self._eof = True
+                return 0
+            if isinstance(item, BaseException):
+                raise item
+            self._buffer = item
+            self._buffer_offset = 0
+
+        view = memoryview(buffer)
+        amount = min(len(view), len(self._buffer) - self._buffer_offset)
+        view[:amount] = self._buffer[self._buffer_offset : self._buffer_offset + amount]
+        self._buffer_offset += amount
+        return amount
+
+    def close(self) -> None:
+        if not self.closed:
+            self._stop.set()
+            while True:
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    break
+            self._thread.join()
+        super().close()
+
+    def _put(self, item: bytes | BaseException | None) -> bool:
+        while not self._stop.is_set():
+            try:
+                self._queue.put(item, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _produce(self) -> None:
+        try:
+            while not self._stop.is_set():
+                chunk = self._source.read(_ARCHIVE_COPY_CHUNK_SIZE)
+                if not chunk:
+                    self._put(None)
+                    return
+                if not self._put(chunk):
+                    return
+        except BaseException as exc:
+            self._put(exc)
+
+
+@contextmanager
+def _open_prefetched_stream(source: io.BufferedIOBase) -> Iterator[io.BufferedReader]:
+    prefetched = _PrefetchReader(source)
+    buffered = io.BufferedReader(prefetched, buffer_size=64 * 1024)
+    try:
+        yield buffered
+    finally:
+        buffered.close()
+
+
+def _zip_entry_data_offset(remote: _RemoteFirmwareArchive, entry: zipfile.ZipInfo) -> int:
+    remote.reader.seek(entry.header_offset)
+    header = remote.reader.read(_ZIP_LOCAL_FILE_HEADER.size)
+    if len(header) != _ZIP_LOCAL_FILE_HEADER.size:
+        raise FUSError(f"could not read ZIP header for {entry.filename!r}")
+    (
+        signature,
+        _extract_version,
+        flags,
+        compression,
+        _modified_time,
+        _modified_date,
+        _crc,
+        _compressed_size,
+        _uncompressed_size,
+        filename_size,
+        extra_size,
+    ) = _ZIP_LOCAL_FILE_HEADER.unpack(header)
+    if signature != _ZIP_LOCAL_FILE_HEADER_SIGNATURE:
+        raise FUSError(f"invalid ZIP header for {entry.filename!r}")
+    if flags & 1:
+        raise FUSError(f"encrypted ZIP entry is not supported: {entry.filename!r}")
+    if compression != entry.compress_type:
+        raise FUSError(f"ZIP compression metadata does not match for {entry.filename!r}")
+    return entry.header_offset + _ZIP_LOCAL_FILE_HEADER.size + filename_size + extra_size
+
+
+def _tar_index_identity(
+    remote: _RemoteFirmwareArchive,
+    outer_entry: zipfile.ZipInfo,
+) -> dict[str, int | str]:
+    return {
+        "firmware": remote.firmware_version,
+        "firmware_file": remote.info.filename,
+        "entry": outer_entry.filename,
+        "header_offset": outer_entry.header_offset,
+        "crc": outer_entry.CRC,
+        "compressed_size": outer_entry.compress_size,
+        "size": outer_entry.file_size,
+    }
+
+
+def _tar_index_paths(
+    remote: _RemoteFirmwareArchive,
+    outer_entry: zipfile.ZipInfo,
+) -> tuple[Path, Path, dict[str, int | str]]:
+    identity = _tar_index_identity(remote, outer_entry)
+    cache_key = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    cache_home = os.environ.get("XDG_CACHE_HOME")
+    cache_root = Path(cache_home).expanduser() if cache_home else Path.home() / ".cache"
+    cache_dir = cache_root / "asgard" / "tar-index"
+    return cache_dir / f"{cache_key}.json", cache_dir / f"{cache_key}.gzidx", identity
+
+
+def _load_tar_index(
+    remote: _RemoteFirmwareArchive,
+    outer_entry: zipfile.ZipInfo,
+) -> _TarIndexCache | None:
+    metadata_path, index_path, identity = _tar_index_paths(remote, outer_entry)
+    if not metadata_path.is_file() or not index_path.is_file():
+        return None
+    try:
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if (
+            payload.get("version") != _TAR_INDEX_VERSION
+            or payload.get("identity") != identity
+            or not isinstance(payload.get("complete"), bool)
+            or not isinstance(payload.get("members"), list)
+            or index_path.stat().st_size <= 0
+        ):
+            return None
+        members: list[_IndexedTarMember] = []
+        for raw_member in payload["members"]:
+            if not isinstance(raw_member, dict):
+                return None
+            name = raw_member.get("name")
+            size = raw_member.get("size")
+            offset_data = raw_member.get("offset_data")
+            if (
+                not isinstance(name, str)
+                or not name
+                or not isinstance(size, int)
+                or size < 0
+                or not isinstance(offset_data, int)
+                or offset_data < 0
+                or offset_data + size > outer_entry.file_size
+            ):
+                return None
+            members.append(_IndexedTarMember(name=name, size=size, offset_data=offset_data))
+        return _TarIndexCache(
+            complete=payload["complete"],
+            members=tuple(members),
+            index_path=index_path,
+        )
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def _indexed_progress(members: tuple[_IndexedTarMember, ...] | list[_IndexedTarMember]) -> int:
+    return max((member.offset_data + member.size for member in members), default=0)
+
+
+def _prefer_indexed_member(member: _IndexedTarMember) -> bool:
+    buffer_size = min(
+        _TAR_INDEX_MEMBER_BUFFER_SIZE,
+        max(_ARCHIVE_COPY_CHUNK_SIZE, member.size),
+    )
+    buffer_count = max(1, (member.size + buffer_size - 1) // buffer_size)
+    return member.offset_data > buffer_count * _TAR_INDEX_SPACING
+
+
+def _discard_tar_index(remote: _RemoteFirmwareArchive, outer_entry: zipfile.ZipInfo) -> None:
+    metadata_path, index_path, _identity = _tar_index_paths(remote, outer_entry)
+    for path in (metadata_path, index_path):
+        with suppress(OSError):
+            path.unlink(missing_ok=True)
+
+
+def _save_tar_index(
+    remote: _RemoteFirmwareArchive,
+    outer_entry: zipfile.ZipInfo,
+    indexed_source: object,
+    members: list[_IndexedTarMember],
+    *,
+    complete: bool,
+) -> None:
+    if not complete and not members:
+        return
+    metadata_path, index_path, identity = _tar_index_paths(remote, outer_entry)
+    existing = _load_tar_index(remote, outer_entry)
+    if existing is not None and (
+        existing.complete or (not complete and _indexed_progress(existing.members) >= _indexed_progress(members))
+    ):
+        return
+
+    suffix = f".{secrets.token_hex(8)}.tmp"
+    metadata_tmp = metadata_path.with_name(f"{metadata_path.name}{suffix}")
+    index_tmp = index_path.with_name(f"{index_path.name}{suffix}")
+    try:
+        metadata_path.parent.mkdir(parents=True, exist_ok=True)
+        indexed_source.export_index(filename=str(index_tmp))
+        index_tmp.replace(index_path)
+        payload = {
+            "version": _TAR_INDEX_VERSION,
+            "identity": identity,
+            "complete": complete,
+            "members": [
+                {
+                    "name": member.name,
+                    "size": member.size,
+                    "offset_data": member.offset_data,
+                }
+                for member in members
+            ],
+        }
+        metadata_tmp.write_text(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        metadata_tmp.replace(metadata_path)
+    except Exception:
+        pass
+    finally:
+        for path in (metadata_tmp, index_tmp):
+            with suppress(OSError):
+                path.unlink(missing_ok=True)
+
+
+@contextmanager
+def _open_indexed_firmware_entry(
+    remote: _RemoteFirmwareArchive,
+    outer_entry: zipfile.ZipInfo,
+    *,
+    index_path: Path | None = None,
+    buffer_size: int | None = None,
+) -> Iterator[io.BufferedIOBase]:
+    try:
+        import indexed_gzip
+    except ImportError as exc:
+        raise FUSError("indexed DEFLATE support is not installed; reinstall asgard") from exc
+
+    virtual_source = _VirtualGzipReader(
+        remote.reader,
+        data_offset=_zip_entry_data_offset(remote, outer_entry),
+        compressed_size=outer_entry.compress_size,
+        crc=outer_entry.CRC,
+        uncompressed_size=outer_entry.file_size,
+    )
+    indexed_source = indexed_gzip.IndexedGzipFile(
+        fileobj=virtual_source,
+        spacing=_TAR_INDEX_SPACING,
+        readbuf_size=_ARCHIVE_COPY_CHUNK_SIZE,
+        readall_buf_size=_ARCHIVE_COPY_CHUNK_SIZE,
+        buffer_size=buffer_size or _TAR_INDEX_SCAN_BUFFER_SIZE,
+    )
+    try:
+        if index_path is not None:
+            try:
+                indexed_source.import_index(filename=str(index_path))
+            except Exception as exc:
+                raise _TarIndexUnavailable from exc
+        yield indexed_source
+    finally:
+        indexed_source.close()
+        virtual_source.close()
+
+
+@contextmanager
+def _open_cached_tar_member(
+    remote: _RemoteFirmwareArchive,
+    outer_entry: zipfile.ZipInfo,
+    cached_member: _IndexedTarMember,
+    index_path: Path,
+) -> Iterator[io.BufferedReader]:
+    buffer_size = min(
+        _TAR_INDEX_MEMBER_BUFFER_SIZE,
+        max(_ARCHIVE_COPY_CHUNK_SIZE, cached_member.size),
+    )
+    with _open_indexed_firmware_entry(
+        remote,
+        outer_entry,
+        index_path=index_path,
+        buffer_size=buffer_size,
+    ) as indexed_source:
+        try:
+            header_offset = cached_member.offset_data - tarfile.BLOCKSIZE
+            if header_offset < 0 or cached_member.offset_data % tarfile.BLOCKSIZE:
+                raise _TarIndexUnavailable
+            indexed_source.seek(header_offset)
+            header = indexed_source.read(tarfile.BLOCKSIZE)
+            if len(header) != tarfile.BLOCKSIZE:
+                raise _TarIndexUnavailable
+            tar_info = tarfile.TarInfo.frombuf(header, encoding="utf-8", errors="surrogateescape")
+            if tar_info.name != cached_member.name or tar_info.size != cached_member.size or not tar_info.isfile():
+                raise _TarIndexUnavailable
+        except _TarIndexUnavailable:
+            raise
+        except Exception as exc:
+            raise _TarIndexUnavailable from exc
+        bounded = _BoundedReader(indexed_source, cached_member.size)
+        source = io.BufferedReader(bounded, buffer_size=64 * 1024)
+        try:
+            yield source
+        finally:
+            source.close()
+
+
+@contextmanager
+def _open_firmware_tar(
+    remote: _RemoteFirmwareArchive,
+    outer_entry: zipfile.ZipInfo,
+) -> Iterator[tarfile.TarFile]:
+    with remote.archive.open(outer_entry, "r") as source:
+        mode = "r:" if outer_entry.compress_type == zipfile.ZIP_STORED else "r|"
+        try:
+            archive = tarfile.open(fileobj=source, mode=mode)
+        except tarfile.TarError as exc:
+            raise FUSError(f"archive entry {outer_entry.filename!r} is not a readable TAR: {exc}") from exc
+        try:
+            yield archive
+        finally:
+            archive.close()
+
+
+def iter_firmware_tar_entries(
+    *,
+    model: str,
+    region: str,
+    outer_selector: str,
+    firmware_version: str | None = None,
+    force_firmware: bool = False,
+) -> Iterator[FirmwareTarEntry]:
+    with _open_remote_firmware_archive(
+        model=model,
+        region=region,
+        firmware_version=firmware_version,
+        force_firmware=force_firmware,
+    ) as remote:
+        outer_entry = _select_single_firmware_entry(remote.archive.infolist(), outer_selector)
+        if outer_entry.compress_type == zipfile.ZIP_DEFLATED:
+            cached = _load_tar_index(remote, outer_entry)
+            if cached is not None and cached.complete:
+                for member in cached.members:
+                    yield FirmwareTarEntry(name=member.name, size=member.size)
+                return
+
+            small_archive = outer_entry.file_size <= _TAR_INDEX_MEMBER_BUFFER_SIZE
+            scan_buffer_size = (
+                max(_ARCHIVE_COPY_CHUNK_SIZE, outer_entry.file_size) if small_archive else _TAR_INDEX_SCAN_BUFFER_SIZE
+            )
+            cache_attempt = cached
+            while True:
+                indexed_members: list[_IndexedTarMember] = []
+                scan_complete = False
+                try:
+                    with _open_indexed_firmware_entry(
+                        remote,
+                        outer_entry,
+                        index_path=cache_attempt.index_path if cache_attempt is not None else None,
+                        buffer_size=scan_buffer_size,
+                    ) as indexed_source:
+                        tar_mode = "r|" if small_archive and cache_attempt is None else "r:"
+                        try:
+                            archive = tarfile.open(fileobj=indexed_source, mode=tar_mode)
+                        except tarfile.TarError as exc:
+                            if cache_attempt is not None:
+                                raise _TarIndexUnavailable from exc
+                            raise FUSError(
+                                f"archive entry {outer_entry.filename!r} is not a readable TAR: {exc}"
+                            ) from exc
+                        try:
+                            for member in archive:
+                                if not member.isfile():
+                                    continue
+                                indexed_member = _IndexedTarMember(
+                                    name=member.name,
+                                    size=member.size,
+                                    offset_data=member.offset_data,
+                                )
+                                indexed_members.append(indexed_member)
+                                yield FirmwareTarEntry(name=member.name, size=member.size)
+                            while indexed_source.read(_ARCHIVE_COPY_CHUNK_SIZE):
+                                pass
+                            scan_complete = True
+                        finally:
+                            archive.close()
+                            _save_tar_index(
+                                remote,
+                                outer_entry,
+                                indexed_source,
+                                indexed_members,
+                                complete=scan_complete,
+                            )
+                    return
+                except _TarIndexUnavailable:
+                    if cache_attempt is None:
+                        raise FUSError(f"cached TAR index for {outer_entry.filename!r} could not be read")
+                    _discard_tar_index(remote, outer_entry)
+                    cache_attempt = None
+                except FUSError:
+                    raise
+                except Exception as exc:
+                    raise FUSError(f"could not read TAR entry {outer_entry.filename!r}: {exc}") from exc
+
+        try:
+            with _open_firmware_tar(remote, outer_entry) as archive:
+                for member in archive:
+                    if member.isfile():
+                        yield FirmwareTarEntry(name=member.name, size=member.size)
+        except FUSError:
+            raise
+        except Exception as exc:
+            raise FUSError(f"could not read TAR entry {outer_entry.filename!r}: {exc}") from exc
+
+
 def _entry_output_path(output_dir: Path, entry_name: str) -> Path:
     filename = PurePosixPath(str(entry_name or "").replace("\\", "/")).name
     if not filename or filename in {".", ".."}:
         raise FUSError(f"invalid archive entry name: {entry_name!r}")
     return output_dir / filename
+
+
+def _copy_stream_with_progress(
+    source: io.BufferedIOBase,
+    output: io.BufferedWriter,
+    *,
+    label: str,
+    total_size: int,
+    initial: bytes = b"",
+) -> int:
+    started_at = time.monotonic()
+    last_render = 0.0
+    done = len(initial)
+    if initial:
+        output.write(initial)
+    while True:
+        chunk = source.read(_ARCHIVE_COPY_CHUNK_SIZE)
+        if not chunk:
+            break
+        output.write(chunk)
+        done += len(chunk)
+        now = time.monotonic()
+        if now - last_render >= _PROGRESS_REFRESH_S and (not total_size or done < total_size):
+            _render_progress(label, done, total_size, started_at)
+            last_render = now
+    _render_progress(label, done, total_size, started_at, complete=True)
+    return done
+
+
+def _read_exact_stream(source: io.BufferedIOBase, size: int, description: str) -> bytes:
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = source.read(remaining)
+        if not chunk:
+            raise FUSError(f"unexpected end of {description}")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _copy_sparse_stream(
+    source: io.BufferedIOBase,
+    output: io.BufferedWriter,
+    *,
+    header_prefix: bytes,
+    label: str,
+) -> int:
+    header = header_prefix + _read_exact_stream(
+        source,
+        _SPARSE_HEADER.size - len(header_prefix),
+        "sparse image header",
+    )
+    (
+        _magic,
+        major_version,
+        _minor_version,
+        file_header_size,
+        chunk_header_size,
+        block_size,
+        total_blocks,
+        total_chunks,
+        image_checksum,
+    ) = _SPARSE_HEADER.unpack(header)
+    if major_version != 1:
+        raise FUSError(f"unsupported sparse image version: {major_version}")
+    if file_header_size < _SPARSE_HEADER.size:
+        raise FUSError(f"invalid sparse file header size: {file_header_size}")
+    if chunk_header_size < _SPARSE_CHUNK_HEADER.size:
+        raise FUSError(f"invalid sparse chunk header size: {chunk_header_size}")
+    if block_size <= 0 or block_size % 4:
+        raise FUSError(f"invalid sparse block size: {block_size}")
+    raw_size = block_size * total_blocks
+    if raw_size > (1 << 63) - 1:
+        raise FUSError(f"sparse image is too large: {raw_size} bytes")
+    if file_header_size > _SPARSE_HEADER.size:
+        _read_exact_stream(source, file_header_size - _SPARSE_HEADER.size, "extended sparse header")
+
+    zero_buffer = bytes(_ARCHIVE_COPY_CHUNK_SIZE)
+    blocks_written = 0
+    logical_done = 0
+    checksum = 0
+    started_at = time.monotonic()
+    last_render = 0.0
+
+    def update_progress(size: int) -> None:
+        nonlocal logical_done, last_render
+        logical_done += size
+        now = time.monotonic()
+        if now - last_render >= _PROGRESS_REFRESH_S and logical_done < raw_size:
+            _render_progress(label, logical_done, raw_size, started_at)
+            last_render = now
+
+    def process_repeated(pattern: bytes, size: int, *, write: bool) -> None:
+        nonlocal checksum
+        repeat_buffer = zero_buffer if pattern == b"\0\0\0\0" else pattern * (_ARCHIVE_COPY_CHUNK_SIZE // 4)
+        remaining = size
+        if not write:
+            output.seek(size, os.SEEK_CUR)
+        while remaining:
+            amount = min(remaining, len(repeat_buffer))
+            chunk = repeat_buffer[:amount]
+            if write:
+                output.write(chunk)
+            checksum = zlib.crc32(chunk, checksum)
+            update_progress(amount)
+            remaining -= amount
+
+    for chunk_index in range(total_chunks):
+        raw_chunk_header = _read_exact_stream(source, chunk_header_size, f"sparse chunk {chunk_index + 1} header")
+        chunk_type, _reserved, chunk_blocks, total_size = _SPARSE_CHUNK_HEADER.unpack_from(raw_chunk_header)
+        if total_size < chunk_header_size:
+            raise FUSError(f"invalid sparse chunk {chunk_index + 1} size: {total_size}")
+        data_size = total_size - chunk_header_size
+
+        if chunk_type == _SPARSE_CRC32:
+            if chunk_blocks != 0 or data_size != 4:
+                raise FUSError(f"invalid sparse CRC chunk {chunk_index + 1}")
+            expected_checksum = struct.unpack("<I", _read_exact_stream(source, 4, "sparse CRC32"))[0]
+            if expected_checksum != checksum:
+                raise FUSError(f"sparse CRC mismatch: expected {expected_checksum:08x}, got {checksum:08x}")
+            continue
+
+        if chunk_blocks > total_blocks - blocks_written:
+            raise FUSError(f"sparse chunk {chunk_index + 1} exceeds the output size")
+        chunk_size = chunk_blocks * block_size
+        blocks_written += chunk_blocks
+
+        if chunk_type == _SPARSE_RAW:
+            if data_size != chunk_size:
+                raise FUSError(f"invalid sparse RAW chunk {chunk_index + 1}")
+            remaining = chunk_size
+            while remaining:
+                amount = min(remaining, _ARCHIVE_COPY_CHUNK_SIZE)
+                data = _read_exact_stream(source, amount, "sparse RAW data")
+                output.write(data)
+                checksum = zlib.crc32(data, checksum)
+                update_progress(len(data))
+                remaining -= len(data)
+        elif chunk_type == _SPARSE_FILL:
+            if data_size != 4:
+                raise FUSError(f"invalid sparse FILL chunk {chunk_index + 1}")
+            pattern = _read_exact_stream(source, 4, "sparse fill pattern")
+            process_repeated(pattern, chunk_size, write=pattern != b"\0\0\0\0")
+        elif chunk_type == _SPARSE_DONT_CARE:
+            if data_size != 0:
+                raise FUSError(f"invalid sparse DONT_CARE chunk {chunk_index + 1}")
+            process_repeated(b"\0\0\0\0", chunk_size, write=False)
+        else:
+            raise FUSError(f"unknown sparse chunk type: 0x{chunk_type:04x}")
+
+    if blocks_written != total_blocks:
+        raise FUSError(f"incomplete sparse image: expected {total_blocks} blocks, got {blocks_written}")
+    if image_checksum and image_checksum != checksum:
+        raise FUSError(f"sparse image checksum mismatch: expected {image_checksum:08x}, got {checksum:08x}")
+    if source.read(1):
+        raise FUSError("sparse image contains trailing data")
+    output.truncate(raw_size)
+    _render_progress(label, raw_size, raw_size, started_at, complete=True)
+    return raw_size
+
+
+def _copy_image_stream(
+    source: io.BufferedIOBase,
+    output: io.BufferedWriter,
+    *,
+    label: str,
+    total_size: int,
+) -> int:
+    prefix = source.read(4)
+    if prefix == struct.pack("<I", _SPARSE_MAGIC):
+        return _copy_sparse_stream(source, output, header_prefix=prefix, label=label)
+    done = _copy_stream_with_progress(
+        source,
+        output,
+        label=label,
+        total_size=total_size,
+        initial=prefix,
+    )
+    if total_size and done != total_size:
+        raise FUSError(f"incomplete output: expected {total_size} bytes, got {done}")
+    return done
+
+
+def _copy_lz4_stream(source: io.BufferedIOBase, output: io.BufferedWriter, *, label: str) -> int:
+    try:
+        from lz4 import frame as lz4_frame
+    except ImportError as exc:
+        raise FUSError("LZ4 support is not installed; reinstall asgard") from exc
+
+    try:
+        frame_info = lz4_frame.get_frame_info(source.peek(19)[:19])
+        total_size = int(frame_info.get("content_size") or 0)
+        with (
+            lz4_frame.LZ4FrameFile(source, mode="rb") as decoded,
+            _open_prefetched_stream(decoded) as prefetched,
+        ):
+            done = _copy_image_stream(prefetched, output, label=label, total_size=total_size)
+    except (_TarIndexUnavailable, FUSError, OSError):
+        raise
+    except Exception as exc:
+        raise FUSError(f"could not decompress LZ4 member: {exc}") from exc
+    return done
+
+
+def _write_firmware_tar_member(
+    source: io.BufferedIOBase,
+    part_path: Path,
+    *,
+    requested_name: str,
+    output_name: str,
+    member_size: int,
+) -> None:
+    with part_path.open("xb") as output:
+        label = f"Extracting {PurePosixPath(output_name).name}"
+        if requested_name.lower().endswith(".lz4"):
+            _copy_lz4_stream(source, output, label=label)
+        else:
+            with _open_prefetched_stream(source) as prefetched:
+                _copy_image_stream(
+                    prefetched,
+                    output,
+                    label=label,
+                    total_size=member_size,
+                )
+
+
+def download_firmware_tar_member(
+    *,
+    model: str,
+    region: str,
+    outer_selector: str,
+    member_name: str,
+    out_dir: str | os.PathLike[str],
+    firmware_version: str | None = None,
+    force_firmware: bool = False,
+) -> Path:
+    requested_name = str(member_name or "").strip().replace("\\", "/")
+    if not requested_name:
+        raise ValueError("TAR member name is required")
+    output_name = requested_name[:-4] if requested_name.lower().endswith(".lz4") else requested_name
+    output_dir = Path(out_dir).expanduser()
+    if output_dir.exists() and not output_dir.is_dir():
+        raise FUSError(f"member output must be a directory: {output_dir}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    destination = _entry_output_path(output_dir.resolve(), output_name)
+    part_path = _partial_output_path(destination)
+    if destination.exists():
+        raise FUSError(f"{destination} already exists")
+    if part_path.exists():
+        raise FUSError(f"{part_path} already exists")
+
+    with _open_remote_firmware_archive(
+        model=model,
+        region=region,
+        firmware_version=firmware_version,
+        force_firmware=force_firmware,
+    ) as remote:
+        outer_entry = _select_single_firmware_entry(remote.archive.infolist(), outer_selector)
+        _print_info(f"model: {remote.model}")
+        _print_info(f"region: {remote.region}")
+        _print_info(f"firmware: {remote.firmware_version}")
+        _print_info(f"archive: {outer_entry.filename}")
+        _print_info(f"member: {requested_name}")
+        _print_info(f"output: {destination}")
+
+        output_complete = False
+        try:
+            member_copied = False
+            cached: _TarIndexCache | None = None
+            cached_member: _IndexedTarMember | None = None
+            if outer_entry.compress_type == zipfile.ZIP_DEFLATED:
+                cached = _load_tar_index(remote, outer_entry)
+                cached_member = (
+                    next(
+                        (member for member in cached.members if member.name == requested_name),
+                        None,
+                    )
+                    if cached is not None
+                    else None
+                )
+                if cached_member is not None and _prefer_indexed_member(cached_member):
+                    try:
+                        with _open_cached_tar_member(
+                            remote,
+                            outer_entry,
+                            cached_member,
+                            cached.index_path,
+                        ) as member_source:
+                            _write_firmware_tar_member(
+                                member_source,
+                                part_path,
+                                requested_name=requested_name,
+                                output_name=output_name,
+                                member_size=cached_member.size,
+                            )
+                        member_copied = True
+                    except (_TarIndexUnavailable, FUSError):
+                        part_path.unlink(missing_ok=True)
+                        _discard_tar_index(remote, outer_entry)
+
+            if not member_copied:
+                if cached is not None and cached.complete and cached_member is None:
+                    raise FUSError(f"TAR member not found: {requested_name}")
+
+                with _open_firmware_tar(remote, outer_entry) as archive:
+                    for member in archive:
+                        if member.name != requested_name:
+                            continue
+                        if not member.isfile():
+                            raise FUSError(f"TAR member is not a regular file: {requested_name}")
+                        member_source = archive.extractfile(member)
+                        if member_source is None:
+                            raise FUSError(f"could not open TAR member: {requested_name}")
+                        with member_source:
+                            _write_firmware_tar_member(
+                                member_source,
+                                part_path,
+                                requested_name=requested_name,
+                                output_name=output_name,
+                                member_size=member.size,
+                            )
+                        member_copied = True
+                        break
+
+            if not member_copied:
+                raise FUSError(f"TAR member not found: {requested_name}")
+            if destination.exists():
+                raise FUSError(f"{destination} already exists")
+            part_path.replace(destination)
+            output_complete = True
+            return destination
+        except FUSError:
+            raise
+        except Exception as exc:
+            raise FUSError(f"could not extract TAR member {requested_name!r}: {exc}") from exc
+        finally:
+            if not output_complete:
+                part_path.unlink(missing_ok=True)
 
 
 def download_firmware_entries(
@@ -1373,31 +2314,24 @@ def download_firmware_entries(
 
         completed_paths: list[Path] = []
         for entry, destination in destinations:
-            started_at = time.monotonic()
-            done = 0
             complete = False
             part_path = _partial_output_path(destination)
             try:
-                with part_path.open("xb") as output, remote.archive.open(entry, "r") as source:
-                    while True:
-                        chunk = source.read(_ARCHIVE_COPY_CHUNK_SIZE)
-                        if not chunk:
-                            break
-                        output.write(chunk)
-                        done += len(chunk)
-                        _render_progress(
-                            f"Downloading {PurePosixPath(entry.filename).name}",
-                            done,
-                            entry.file_size,
-                            started_at,
+                with (
+                    part_path.open("xb") as output,
+                    remote.archive.open(entry, "r") as source,
+                    _open_prefetched_stream(source) as prefetched,
+                ):
+                    done = _copy_stream_with_progress(
+                        prefetched,
+                        output,
+                        label=f"Downloading {PurePosixPath(entry.filename).name}",
+                        total_size=entry.file_size,
+                    )
+                    if done != entry.file_size:
+                        raise FUSError(
+                            f"incomplete archive entry {entry.filename!r}: expected {entry.file_size} bytes, got {done}"
                         )
-                _render_progress(
-                    f"Downloading {PurePosixPath(entry.filename).name}",
-                    done,
-                    entry.file_size,
-                    started_at,
-                    complete=True,
-                )
                 if destination.exists():
                     raise FUSError(f"{destination} already exists")
                 part_path.replace(destination)

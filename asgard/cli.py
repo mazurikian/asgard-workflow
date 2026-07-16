@@ -141,7 +141,7 @@ def _build_parser() -> argparse.ArgumentParser:
     download_parser.add_argument(
         "-o",
         "--output",
-        help="Output file or directory; --entry always treats this as a directory",
+        help="Output file or directory; --entry and --member use a directory",
     )
     download_parser.add_argument("--resume", action="store_true")
     download_parser.add_argument("--decrypt", action="store_true", help="Decrypt while downloading")
@@ -149,9 +149,13 @@ def _build_parser() -> argparse.ArgumentParser:
     archive_mode.add_argument(
         "--list-entries",
         action="store_true",
-        help="List files inside the remote firmware ZIP without downloading the package",
+        help="List files inside the firmware ZIP, or inside --entry when combined",
     )
     archive_mode.add_argument(
+        "--member",
+        help="Extract one TAR file; LZ4 and Android sparse images are decoded automatically",
+    )
+    download_parser.add_argument(
         "--entry",
         action="append",
         metavar="SELECTOR",
@@ -200,6 +204,19 @@ def main(argv: list[str] | None = None) -> int:
                     parser.error("--decrypt cannot be used with --list-entries")
                 if args.output:
                     parser.error("--output cannot be used with --list-entries")
+                if args.entry:
+                    if len(args.entry) != 1:
+                        parser.error("TAR listing requires exactly one --entry selector")
+                    print(f"{'Size':>12}  Name")
+                    for entry in fus.iter_firmware_tar_entries(
+                        model=args.model,
+                        region=args.region,
+                        firmware_version=args.firmware,
+                        force_firmware=args.force_firmware,
+                        outer_selector=args.entry[0],
+                    ):
+                        print(f"{fus._format_bytes(entry.size):>12}  {entry.name}")
+                    return 0
                 listing = fus.list_firmware_entries(
                     model=args.model,
                     region=args.region,
@@ -216,6 +233,27 @@ def main(argv: list[str] | None = None) -> int:
                         f"{fus._format_bytes(entry.size):>12} "
                         f"{fus._format_bytes(entry.compressed_size):>12}  {entry.name}"
                     )
+                return 0
+
+            if args.member:
+                if not args.entry or len(args.entry) != 1:
+                    parser.error("--member requires exactly one --entry selector")
+                if args.resume:
+                    parser.error("--resume is not supported with --member")
+                if args.decrypt:
+                    parser.error("--decrypt is not needed with --member")
+                if not args.output:
+                    parser.error("--output is required with --member")
+                path = fus.download_firmware_tar_member(
+                    model=args.model,
+                    region=args.region,
+                    firmware_version=args.firmware,
+                    force_firmware=args.force_firmware,
+                    outer_selector=args.entry[0],
+                    member_name=args.member,
+                    out_dir=args.output,
+                )
+                print(path)
                 return 0
 
             if not args.output:
