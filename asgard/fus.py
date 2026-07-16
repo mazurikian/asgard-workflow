@@ -880,10 +880,7 @@ class _FUSDecryptingReader(io.RawIOBase):
             self._stream_failures = 1
         if self._stream_failures > _DOWNLOAD_RETRIES:
             raise FUSError(f"firmware stream failed after retries at byte {self._position}: {exc}") from exc
-        if (
-            self._recover_download is not None
-            and self._stream_failures % _DOWNLOAD_RECOVERY_INTERVAL == 0
-        ):
+        if self._recover_download is not None and self._stream_failures % _DOWNLOAD_RECOVERY_INTERVAL == 0:
             try:
                 self._recover_download()
             except Exception as recovery_exc:
@@ -1292,10 +1289,7 @@ def _entry_matches_selector(entry: zipfile.ZipInfo, selector: str) -> bool:
         return True
     if any(character in normalized_selector for character in "*?["):
         return fnmatch.fnmatchcase(name_lower, selector_lower) or fnmatch.fnmatchcase(basename_lower, selector_lower)
-    return (
-        name_lower.startswith(f"{selector_lower}_")
-        or basename_lower.startswith(f"{selector_lower}_")
-    )
+    return name_lower.startswith(f"{selector_lower}_") or basename_lower.startswith(f"{selector_lower}_")
 
 
 def _select_firmware_entries(
