@@ -864,6 +864,33 @@ def extract_super_partitions(
         metadata = _read_lp_metadata(reader)
         selected = _select_lp_partitions(metadata, requested)
         spans, sizes = _build_super_copy_plan(metadata, selected, reader)
+        progress_start = reader.tell()
+        progress_end = spans[-1].source_offset + spans[-1].size if spans else progress_start
+        progress_total = progress_end - progress_start
+        if len(selected) == 1:
+            progress_label = f"Streaming super for {selected[0].name}"
+        else:
+            progress_label = f"Streaming super for {len(selected)} partitions"
+        progress_started_at = time.monotonic()
+        progress_last_render = progress_started_at - _PROGRESS_REFRESH_S
+
+        def update_progress(*, complete: bool = False) -> None:
+            nonlocal progress_last_render
+            if not progress_total:
+                return
+            now = time.monotonic()
+            done = min(progress_total, max(0, reader.tell() - progress_start))
+            if not complete and (done >= progress_total or now - progress_last_render < _PROGRESS_REFRESH_S):
+                return
+            render_progress(
+                progress_label,
+                done,
+                progress_total,
+                progress_started_at,
+                complete=complete,
+            )
+            progress_last_render = now
+
         paths: dict[str, tuple[Path, Path]] = {}
         for partition in selected:
             destination = output_dir / f"{partition.name}.img"
@@ -881,16 +908,24 @@ def extract_super_partitions(
                 with part_path.open("xb"):
                     pass
             for span in spans:
-                reader.skip_to(span.source_offset)
+                while reader.tell() < span.source_offset:
+                    reader.skip_to(min(span.source_offset, reader.tell() + _ARCHIVE_COPY_CHUNK_SIZE))
+                    update_progress()
                 with paths[span.partition_name][1].open("r+b") as output:
                     output.seek(span.destination_offset)
-                    reader.copy_to(
-                        output,
-                        span.size,
-                        hole_block_size=metadata.logical_block_size,
-                    )
+                    remaining = span.size
+                    while remaining:
+                        amount = min(remaining, _ARCHIVE_COPY_CHUNK_SIZE)
+                        reader.copy_to(
+                            output,
+                            amount,
+                            hole_block_size=metadata.logical_block_size,
+                        )
+                        remaining -= amount
+                        update_progress()
             if reader.raw_size is not None and reader.tell() == reader.raw_size:
                 reader.finish(require_eof=True)
+            update_progress(complete=True)
             for name, (_destination, part_path) in paths.items():
                 with part_path.open("r+b") as output:
                     output.truncate(sizes[name])
