@@ -129,6 +129,7 @@ def _open_remote_firmware_archive(
             encrypted_size=info.size,
             key=_fus._decryption_key_from_info(info, model_u, region_u),
             recover_download=recover_download,
+            stream_chunk_size=_ARCHIVE_COPY_CHUNK_SIZE,
         )
     except Exception:
         client.session.close()
@@ -332,8 +333,10 @@ class _BoundedReader(io.RawIOBase):
             return 0
         view = memoryview(buffer)
         amount = min(len(view), self._remaining)
+        if not amount:
+            return 0
         try:
-            data = self._source.read(amount)
+            received = self._source.readinto(view[:amount])
         except Exception as exc:
             if exc.__class__.__module__.partition(".")[0] == "indexed_gzip" or isinstance(
                 exc,
@@ -341,11 +344,10 @@ class _BoundedReader(io.RawIOBase):
             ):
                 raise StreamSourceError from exc
             raise
-        if not data:
+        if not isinstance(received, int) or not 0 < received <= amount:
             raise StreamSourceError
-        view[: len(data)] = data
-        self._remaining -= len(data)
-        return len(data)
+        self._remaining -= received
+        return received
 
 
 def _zip_entry_data_offset(remote: _RemoteFirmwareArchive, entry: zipfile.ZipInfo) -> int:
@@ -1041,8 +1043,7 @@ def download_firmware_entries(
         print_info(f"entries: {len(destinations)}")
         print_info(f"output: {output_dir}")
 
-        completed_paths: list[Path] = []
-        for entry, destination in destinations:
+        for entry, destination in sorted(destinations, key=lambda item: item[0].header_offset):
             complete = False
             part_path = _fus._partial_output_path(destination)
             try:
@@ -1065,7 +1066,6 @@ def download_firmware_entries(
                     raise FUSError(f"{destination} already exists")
                 part_path.replace(destination)
                 complete = True
-                completed_paths.append(destination)
             except FUSError:
                 raise
             except Exception as exc:
@@ -1074,4 +1074,4 @@ def download_firmware_entries(
                 if not complete:
                     part_path.unlink(missing_ok=True)
 
-        return tuple(completed_paths)
+        return tuple(destination for _entry, destination in destinations)

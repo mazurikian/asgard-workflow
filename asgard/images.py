@@ -18,7 +18,13 @@ from pathlib import Path
 from .constants import _ARCHIVE_COPY_CHUNK_SIZE, _PROGRESS_REFRESH_S
 from .errors import FUSError, StreamSourceError
 from .progress import render_progress
-from .streaming import copy_stream_with_progress, open_prefetched_stream, read_exact_stream, write_data_or_hole
+from .streaming import (
+    copy_stream_with_progress,
+    open_prefetched_stream,
+    read_exact_stream,
+    write_data_or_hole,
+    write_data_or_holes,
+)
 
 _SPARSE_HEADER = struct.Struct("<I4H4I")
 _SPARSE_CHUNK_HEADER = struct.Struct("<2H2I")
@@ -168,12 +174,13 @@ class _RawForwardReader:
         remaining = size
         while remaining:
             amount = min(remaining, _ARCHIVE_COPY_CHUNK_SIZE)
-            if hole_block_size:
-                amount = min(amount, hole_block_size)
             data = self.read(amount)
             if len(data) != amount:
                 raise FUSError("unexpected end of raw super image")
-            write_data_or_hole(output, data)
+            if hole_block_size:
+                write_data_or_holes(output, data, hole_block_size)
+            else:
+                write_data_or_hole(output, data)
             remaining -= amount
 
     def finish(self, *, require_eof: bool) -> None:
@@ -324,18 +331,18 @@ class _SparseRawReader:
             if not self._chunk_remaining and not self._load_next_chunk():
                 raise FUSError("unexpected end of sparse image")
             amount = min(remaining, self._chunk_remaining, _ARCHIVE_COPY_CHUNK_SIZE)
-            if output is not None and hole_block_size and self._chunk_type == _SPARSE_RAW:
-                amount = min(amount, hole_block_size)
             if self._chunk_type == _SPARSE_RAW:
                 data = read_exact_stream(self._source, amount, "sparse RAW data")
             else:
                 data = self._repeated_data(self._chunk_pattern, self._pattern_offset, amount)
 
             if output is not None:
-                if self._chunk_type == _SPARSE_DONT_CARE or data.count(0) == len(data):
+                if self._chunk_type == _SPARSE_DONT_CARE:
                     output.seek(len(data), os.SEEK_CUR)
+                elif hole_block_size and self._chunk_type == _SPARSE_RAW:
+                    write_data_or_holes(output, data, hole_block_size)
                 else:
-                    output.write(data)
+                    write_data_or_hole(output, data)
             if collect:
                 collected.append(data)
             self._checksum = zlib.crc32(data, self._checksum)

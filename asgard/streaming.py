@@ -47,7 +47,7 @@ class _PrefetchReader(io.RawIOBase):
 
         view = memoryview(buffer)
         amount = min(len(view), len(self._buffer) - self._buffer_offset)
-        view[:amount] = self._buffer[self._buffer_offset : self._buffer_offset + amount]
+        view[:amount] = memoryview(self._buffer)[self._buffer_offset : self._buffer_offset + amount]
         self._buffer_offset += amount
         return amount
 
@@ -133,8 +133,45 @@ def read_exact_stream(source: io.BufferedIOBase, size: int, description: str) ->
     return b"".join(chunks)
 
 
+def is_zero_data(data: bytes) -> bool:
+    return not data or (data[0] == 0 and data[-1] == 0 and data.count(0) == len(data))
+
+
 def write_data_or_hole(output: io.BufferedWriter, data: bytes) -> None:
-    if data.count(0) == len(data):
+    if is_zero_data(data):
         output.seek(len(data), os.SEEK_CUR)
     else:
         output.write(data)
+
+
+def write_data_or_holes(output: io.BufferedWriter, data: bytes, block_size: int) -> None:
+    if block_size <= 0:
+        raise ValueError("hole block size must be positive")
+    if len(data) <= block_size:
+        write_data_or_hole(output, data)
+        return
+
+    zero_block = bytes(block_size)
+    view = memoryview(data)
+    run_start = 0
+    run_is_zero = data.startswith(zero_block, 0, block_size)
+    offset = block_size
+    while offset < len(data):
+        end = min(offset + block_size, len(data))
+        if end - offset == block_size:
+            is_zero = data.startswith(zero_block, offset, end)
+        else:
+            is_zero = is_zero_data(data[offset:end])
+        if is_zero != run_is_zero:
+            if run_is_zero:
+                output.seek(offset - run_start, os.SEEK_CUR)
+            else:
+                output.write(view[run_start:offset])
+            run_start = offset
+            run_is_zero = is_zero
+        offset = end
+
+    if run_is_zero:
+        output.seek(len(data) - run_start, os.SEEK_CUR)
+    else:
+        output.write(view[run_start:])

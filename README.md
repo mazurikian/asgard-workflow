@@ -16,7 +16,7 @@ python -m asgard download SM-S721B EUX --archive AP --list-entries
 python -m asgard download SM-S721B EUX --archive AP --file super.img.lz4 -o ./downloads
 python -m asgard download SM-S721B EUX --archive AP --file super.img.lz4 --keep-sparse -o ./downloads
 python -m asgard download SM-S721B EUX --archive AP --list-partitions
-python -m asgard download SM-S721B EUX --archive AP --partition system_a --partition vendor_a -o ./downloads
+python -m asgard download SM-S721B EUX --archive AP --partition system --partition vendor -o ./downloads
 python -m asgard download SM-S721B EUX --archive AP --unpack-super -o ./downloads
 python -m asgard download SM-S721B EUX --firmware S721BXXSACZB2/S721BOXMACZB2/S721BXXSACZB2/S721BXXSACZB2 -o ./downloads
 python -m asgard decrypt SM-S721B EUX ./file.zip.enc4 -o ./file.zip
