@@ -91,6 +91,19 @@ class _TarIndexCache:
     index_path: Path
 
 
+class _FileWithoutFileno:
+    """Keep indexed-gzip from wrapping a Python-owned descriptor with fdopen."""
+
+    def __init__(self, source: io.BufferedIOBase):
+        self._source = source
+
+    def fileno(self) -> int:
+        raise io.UnsupportedOperation("fileno")
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._source, name)
+
+
 @dataclass
 class _RemoteFirmwareArchive:
     model: str
@@ -490,8 +503,6 @@ def _save_tar_index(
     index_tmp = index_path.with_name(f"{index_path.name}{suffix}")
     try:
         metadata_path.parent.mkdir(parents=True, exist_ok=True)
-        indexed_source.export_index(filename=str(index_tmp))
-        index_tmp.replace(index_path)
         payload = {
             "version": _TAR_INDEX_VERSION,
             "identity": identity,
@@ -505,10 +516,11 @@ def _save_tar_index(
                 for member in members
             ],
         }
-        metadata_tmp.write_text(
-            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-            encoding="utf-8",
-        )
+        serialized_metadata = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        with index_tmp.open("wb") as index_output, metadata_tmp.open("w", encoding="utf-8") as metadata_output:
+            indexed_source.export_index(fileobj=_FileWithoutFileno(index_output))
+            metadata_output.write(serialized_metadata)
+        index_tmp.replace(index_path)
         metadata_tmp.replace(metadata_path)
     except Exception:
         pass
@@ -548,7 +560,8 @@ def _open_indexed_firmware_entry(
     try:
         if index_path is not None:
             try:
-                indexed_source.import_index(filename=str(index_path))
+                with index_path.open("rb") as index_input:
+                    indexed_source.import_index(fileobj=_FileWithoutFileno(index_input))
             except Exception as exc:
                 raise StreamSourceError from exc
         yield indexed_source
