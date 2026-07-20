@@ -49,7 +49,7 @@ jobs:
 
       - name: GH Release
         if: ${{ env.TAG_EXISTS == 'false' }}
-        uses: softprops/action-gh-release@v3.0.1
+        uses: softprops/action-gh-release@v3.0.2
         with:
           files: ${{ env.FILE_PATH }}*
           name: ${{ env.FIRMWARE_VERSION }}
