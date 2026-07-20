@@ -3,8 +3,8 @@
 
 from __future__ import annotations
 
-__version__ = "1.2"
+__version__ = "2.0"
 
-from .fus import FUSError
+from .errors import FUSError
 
 __all__ = ["FUSError", "__version__"]

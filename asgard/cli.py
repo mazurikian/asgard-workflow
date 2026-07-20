@@ -11,7 +11,9 @@ from pathlib import Path
 
 import requests
 
-from . import __version__, fus
+from . import __version__, archive, fus
+from .errors import FUSError
+from .progress import format_bytes
 
 _HISTORY_WRAP_WIDTH = 100
 _FIRMWARE_HELP = "Firmware version to use, for example S721BXXSACZB2/S721BOXMACZB2/S721BXXSACZB2/S721BXXSACZB2Z"
@@ -104,13 +106,8 @@ def _add_device_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("region")
 
 
-def _add_firmware_override_args(parser: argparse.ArgumentParser) -> None:
+def _add_firmware_arg(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--firmware", help=_FIRMWARE_HELP)
-    parser.add_argument(
-        "--force-firmware",
-        action="store_true",
-        help="Use --firmware instead of the latest firmware returned by FUS",
-    )
 
 
 def _download_output_args(output: str) -> tuple[Path | None, Path | None]:
@@ -137,16 +134,58 @@ def _build_parser() -> argparse.ArgumentParser:
 
     download_parser = subparsers.add_parser("download", help="Download firmware from FUS")
     _add_device_args(download_parser)
-    _add_firmware_override_args(download_parser)
-    download_parser.add_argument("-o", "--output", required=True, help="Output file or directory")
+    _add_firmware_arg(download_parser)
+    download_parser.add_argument(
+        "-o",
+        "--output",
+        help="Output file or directory; --archive and --file use a directory",
+    )
     download_parser.add_argument("--resume", action="store_true")
     download_parser.add_argument("--decrypt", action="store_true", help="Decrypt while downloading")
+    content_mode = download_parser.add_mutually_exclusive_group()
+    content_mode.add_argument(
+        "--list-entries",
+        action="store_true",
+        help="List archives in the firmware ZIP, or files inside --archive when combined",
+    )
+    content_mode.add_argument(
+        "--file",
+        metavar="NAME",
+        help="Stream one file from --archive; LZ4 and sparse images are decoded automatically",
+    )
+    content_mode.add_argument(
+        "--list-partitions",
+        action="store_true",
+        help="List partitions in the super image inside --archive",
+    )
+    content_mode.add_argument(
+        "--partition",
+        action="append",
+        metavar="NAME",
+        help="Stream a partition from the super image; repeat to extract multiple partitions",
+    )
+    content_mode.add_argument(
+        "--unpack-super",
+        action="store_true",
+        help="Stream every partition from the super image",
+    )
+    download_parser.add_argument(
+        "--archive",
+        action="append",
+        metavar="SELECTOR",
+        help="Select an archive in the firmware ZIP; repeat or use a glob such as '*.zip'",
+    )
+    download_parser.add_argument(
+        "--keep-sparse",
+        action="store_true",
+        help="Keep an Android sparse image instead of converting it to raw",
+    )
 
     decrypt_parser = subparsers.add_parser("decrypt", help="Decrypt an encrypted FUS package")
     _add_device_args(decrypt_parser)
     decrypt_parser.add_argument("input")
     decrypt_parser.add_argument("-o", "--output")
-    _add_firmware_override_args(decrypt_parser)
+    _add_firmware_arg(decrypt_parser)
     decrypt_parser.add_argument("--enc-ver", type=int, choices=[2, 4], default=4)
 
     return parser
@@ -177,12 +216,128 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "download":
+            if args.keep_sparse and not args.file:
+                parser.error("--keep-sparse requires --file")
+
+            if args.list_entries:
+                if args.resume:
+                    parser.error("--resume cannot be used with --list-entries")
+                if args.decrypt:
+                    parser.error("--decrypt cannot be used with --list-entries")
+                if args.output:
+                    parser.error("--output cannot be used with --list-entries")
+                if args.archive:
+                    if len(args.archive) != 1:
+                        parser.error("listing files requires exactly one --archive selector")
+                    print(f"{'Size':>12}  Name")
+                    for entry in archive.iter_firmware_tar_entries(
+                        model=args.model,
+                        region=args.region,
+                        firmware_version=args.firmware,
+                        outer_selector=args.archive[0],
+                    ):
+                        print(f"{format_bytes(entry.size):>12}  {entry.name}")
+                    return 0
+                listing = archive.list_firmware_entries(
+                    model=args.model,
+                    region=args.region,
+                    firmware_version=args.firmware,
+                )
+                print(f"firmware: {listing.firmware_version}")
+                print(f"filename: {listing.filename}")
+                print(f"size: {format_bytes(listing.size)}")
+                print()
+                print(f"{'Size':>12} {'Compressed':>12}  Name")
+                for entry in listing.entries:
+                    print(f"{format_bytes(entry.size):>12} {format_bytes(entry.compressed_size):>12}  {entry.name}")
+                return 0
+
+            if args.list_partitions:
+                if not args.archive or len(args.archive) != 1:
+                    parser.error("--list-partitions requires exactly one --archive selector")
+                if args.resume:
+                    parser.error("--resume cannot be used with --list-partitions")
+                if args.decrypt:
+                    parser.error("--decrypt cannot be used with --list-partitions")
+                if args.output:
+                    parser.error("--output cannot be used with --list-partitions")
+                print(f"{'Size':>12}  Name")
+                for partition in archive.iter_firmware_super_partitions(
+                    model=args.model,
+                    region=args.region,
+                    firmware_version=args.firmware,
+                    outer_selector=args.archive[0],
+                ):
+                    print(f"{format_bytes(partition.size):>12}  {partition.name}")
+                return 0
+
+            if args.file:
+                if not args.archive or len(args.archive) != 1:
+                    parser.error("--file requires exactly one --archive selector")
+                if args.resume:
+                    parser.error("--resume is not supported with --file")
+                if args.decrypt:
+                    parser.error("--decrypt is not needed with --file")
+                if not args.output:
+                    parser.error("--output is required with --file")
+                path = archive.download_firmware_tar_member(
+                    model=args.model,
+                    region=args.region,
+                    firmware_version=args.firmware,
+                    outer_selector=args.archive[0],
+                    member_name=args.file,
+                    out_dir=args.output,
+                    keep_sparse=args.keep_sparse,
+                )
+                print(path)
+                return 0
+
+            if args.partition is not None or args.unpack_super:
+                option = "--partition" if args.partition is not None else "--unpack-super"
+                if not args.archive or len(args.archive) != 1:
+                    parser.error(f"{option} requires exactly one --archive selector")
+                if args.resume:
+                    parser.error(f"--resume is not supported with {option}")
+                if args.decrypt:
+                    parser.error(f"--decrypt is not needed with {option}")
+                if not args.output:
+                    parser.error(f"--output is required with {option}")
+                paths = archive.download_firmware_super_partitions(
+                    model=args.model,
+                    region=args.region,
+                    firmware_version=args.firmware,
+                    outer_selector=args.archive[0],
+                    partitions=tuple(args.partition) if args.partition is not None else None,
+                    output=args.output,
+                )
+                for path in paths:
+                    print(path)
+                return 0
+
+            if not args.output:
+                parser.error("--output is required unless a listing option is used")
+
+            if args.archive:
+                if args.resume:
+                    parser.error("--resume is not supported with --archive")
+                if args.decrypt:
+                    parser.error("--decrypt is not needed with --archive; archives are decrypted automatically")
+                paths = archive.download_firmware_entries(
+                    model=args.model,
+                    region=args.region,
+                    firmware_version=args.firmware,
+                    selectors=args.archive,
+                    out_dir=args.output,
+                )
+                for path in paths:
+                    print(path)
+                return 0
+
             out_dir, out_file = _download_output_args(args.output)
             result = fus.download_firmware(
                 model=args.model,
                 region=args.region,
                 firmware_version=args.firmware,
-                force_firmware=args.force_firmware,
                 out_dir=out_dir,
                 out_file=out_file,
                 resume=args.resume,
@@ -199,7 +354,6 @@ def main(argv: list[str] | None = None) -> int:
             in_file=args.input,
             out_file=out_path,
             enc_ver=args.enc_ver,
-            force_firmware=args.force_firmware,
         )
         print(final_path)
         return 0
@@ -208,7 +362,7 @@ def main(argv: list[str] | None = None) -> int:
     except FileNotFoundError as exc:
         _print_error(f"file not found: {exc}")
         return 2
-    except fus.FUSError as exc:
+    except FUSError as exc:
         _print_error(str(exc))
         return 1
     except requests.RequestException as exc:

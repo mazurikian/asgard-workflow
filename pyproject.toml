@@ -7,11 +7,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "asgard"
-version = "1.2"
+version = "2.0"
 license = "GPL-3.0-only"
 license-files = ["LICENSE"]
 authors = [{ name = "ducthoe" }]
 dependencies = [
+    "indexed-gzip>=1.10.3",
+    "lz4>=4.3.2",
     "pycryptodomex>=3.20.0",
     "requests>=2.0.0",
 ]
